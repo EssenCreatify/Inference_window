@@ -19,6 +19,7 @@ class WindowMetrics:
     pose_score: float
     motion_score: float
     face_confidence: float
+    face_quality: float  # New metric for face occlusion detection
     lighting_score: float
     stability_score: float
     final_score: float
@@ -31,6 +32,7 @@ class FrameMetrics:
     pose_score: float
     motion_score: float
     face_confidence: float
+    face_quality: float  # New metric for face occlusion detection
     lighting_score: float
     stability_score: float
     final_score: float
@@ -38,11 +40,12 @@ class FrameMetrics:
 class WindowScorer:
     def __init__(self, weights: Dict[str, float] = None):
         self.weights = weights or {
-            'pose': 0.3,
+            'pose': 0.25,
             'motion': 0.15,
-            'face': 0.2,
+            'face': 0.15,
+            'face_quality': 0.15,  # New weight for face quality
             'lighting': 0.15,
-            'stability': 0.2
+            'stability': 0.15
         }
         assert abs(sum(self.weights.values()) - 1.0) < 1e-6, "Weights must sum to 1.0"
 
@@ -94,10 +97,97 @@ class WindowScorer:
         # Use the confidence score from the face detector
         return float(bb[0][4])  # Assuming the last value in bb is confidence
 
+    def compute_face_quality(self, frame: np.ndarray) -> float:
+        """
+        Compute face quality score based on landmark confidence and face completeness.
+        This helps detect when parts of the face are occluded or low quality.
+        """
+        landmarks, bb = torchlm.runtime.forward(frame)
+        if bb.shape[0] == 0:
+            return 0.0
+        
+        # Get landmarks for the first detected face
+        face_landmarks = landmarks[0]  # Shape: (68, 2) for 68 landmarks
+        
+        # For cropped face images, we need a different approach since all landmarks are visible
+        # Instead of checking visibility, we'll analyze landmark confidence and distribution
+        
+        # 1. Check landmark confidence (if available) - this indicates detection quality
+        # Since we don't have per-landmark confidence, we'll use the overall face confidence
+        face_confidence = float(bb[0][4])
+        
+        # 2. Analyze landmark distribution quality
+        h, w = frame.shape[:2]
+        
+        # Check if landmarks are well-distributed (not clustered in one area)
+        landmark_std_x = np.std(face_landmarks[:, 0])
+        landmark_std_y = np.std(face_landmarks[:, 1])
+        
+        # Normalize by frame size
+        normalized_std_x = landmark_std_x / w
+        normalized_std_y = landmark_std_y / h
+        
+        # Good distribution should have reasonable spread (not too small, not too large)
+        distribution_score = min(normalized_std_x, normalized_std_y) * 4  # Scale to [0,1]
+        distribution_score = min(distribution_score, 1.0)
+        
+        # 3. Check for landmark clustering (occlusion often causes landmarks to cluster)
+        # Calculate average distance between landmarks
+        distances = []
+        for i in range(len(face_landmarks)):
+            for j in range(i+1, len(face_landmarks)):
+                dist = np.linalg.norm(face_landmarks[i] - face_landmarks[j])
+                distances.append(dist)
+        
+        avg_distance = np.mean(distances)
+        max_possible_distance = np.sqrt(w*w + h*h)
+        distance_score = min(avg_distance / max_possible_distance * 2, 1.0)  # Scale to [0,1]
+        
+        # 4. Check for unusual landmark patterns (e.g., landmarks too close together)
+        # Calculate minimum distance between landmarks
+        min_distance = np.min(distances) if distances else 0
+        min_distance_score = min(min_distance / 50.0, 1.0)  # Penalize if landmarks are too close
+        
+        # 5. Mouth area specific check (most important for speech)
+        mouth_landmarks = face_landmarks[48:68]  # Mouth landmarks
+        
+        # Calculate mouth area and spread
+        mouth_spread_x = np.std(mouth_landmarks[:, 0])
+        mouth_spread_y = np.std(mouth_landmarks[:, 1])
+        
+        # Calculate mouth area (approximate)
+        mouth_bbox = [
+            np.min(mouth_landmarks[:, 0]), np.max(mouth_landmarks[:, 0]),
+            np.min(mouth_landmarks[:, 1]), np.max(mouth_landmarks[:, 1])
+        ]
+        mouth_area = (mouth_bbox[1] - mouth_bbox[0]) * (mouth_bbox[3] - mouth_bbox[2])
+        
+        # Check for mouth collapse (occlusion often reduces mouth area)
+        expected_mouth_area = 2000  # Approximate expected mouth area in pixels
+        mouth_area_score = min(mouth_area / expected_mouth_area, 1.0)
+        
+        # Check for mouth spread (occlusion often reduces spread)
+        mouth_spread_score = min((mouth_spread_x + mouth_spread_y) / 60.0, 1.0)
+        
+        # Combined mouth quality (area and spread)
+        mouth_quality = 0.6 * mouth_area_score + 0.4 * mouth_spread_score
+        
+        # Combine all scores with much higher focus on mouth area and occlusion detection
+        final_quality = (
+            0.1 * face_confidence +      # Reduced weight for overall detection confidence
+            0.15 * distribution_score +  # Landmark distribution
+            0.15 * distance_score +      # Average landmark distance
+            0.1 * min_distance_score +   # Minimum landmark distance
+            0.5 * mouth_quality          # Much higher weight for mouth area quality
+        )
+        
+        return float(final_quality)
+
     def compute_window_metrics(self, 
                              poses: List[Tuple[float, float, float]],
                              motions: List[float],
                              face_confidences: List[float],
+                             face_qualities: List[float],
                              lighting_scores: List[float],
                              times: List[float]) -> WindowMetrics:
         
@@ -112,6 +202,9 @@ class WindowScorer:
         # Face detection confidence
         face_confidence = np.mean(face_confidences)
         
+        # Face quality (occlusion detection)
+        face_quality = np.mean(face_qualities)
+        
         # Lighting conditions
         lighting_score = np.mean(lighting_scores)
         
@@ -123,6 +216,7 @@ class WindowScorer:
             self.weights['pose'] * pose_score +
             self.weights['motion'] * motion_score +
             self.weights['face'] * face_confidence +
+            self.weights['face_quality'] * face_quality +
             self.weights['lighting'] * lighting_score +
             self.weights['stability'] * stability_score
         )
@@ -131,6 +225,7 @@ class WindowScorer:
             pose_score=pose_score,
             motion_score=motion_score,
             face_confidence=face_confidence,
+            face_quality=face_quality,
             lighting_score=lighting_score,
             stability_score=stability_score,
             final_score=final_score,
@@ -236,10 +331,15 @@ def compute_motion(prev_gray, gray, use_gpu):
 def process_video(cropped_frames, frame_indices, video_fps, pose_model):
     use_gpu = cv2.cuda.getCudaEnabledDeviceCount() > 0
     yaw_list, pitch_list, roll_list, motion_list = [], [], [], []
-    face_confidences_list, lighting_scores_list = [], []
+    face_confidences_list, face_qualities_list, lighting_scores_list = [], [], []
     prev_gray = None
     poses = []  # Store all poses for stability calculation
     scorer = WindowScorer()
+    
+    # For temporal consistency check
+    face_quality_history = []
+    # For temporal jitter check
+    mouth_landmarks_history = []
 
     print("\n📊 Processing video frames...")
     for i, frame in enumerate(tqdm(cropped_frames, desc="Frame analysis")):
@@ -259,7 +359,18 @@ def process_video(cropped_frames, frame_indices, video_fps, pose_model):
 
         # Other metrics
         face_confidences_list.append(scorer.compute_face_confidence(frame))
+        current_face_quality = scorer.compute_face_quality(frame)
+        face_qualities_list.append(current_face_quality)
+        face_quality_history.append(current_face_quality)
         lighting_scores_list.append(scorer.compute_lighting_score(frame))
+
+        # Save mouth landmarks for jitter analysis
+        landmarks, bb = torchlm.runtime.forward(frame)
+        if bb.shape[0] > 0:
+            mouth_landmarks = landmarks[0][48:68]  # (20, 2)
+            mouth_landmarks_history.append(mouth_landmarks)
+        else:
+            mouth_landmarks_history.append(None)
 
     times = [idx / video_fps for idx in frame_indices]
     
@@ -269,12 +380,36 @@ def process_video(cropped_frames, frame_indices, video_fps, pose_model):
     # Calculate per-frame scores
     frame_metrics = []
     stability_window_size = int(video_fps)  # 1-second window for stability
+    jitter_window = 5  # Number of frames for jitter analysis
 
     for i in range(len(times)):
         pose_score = scorer.compute_pose_score(poses[i])
         motion_score = scorer.compute_motion_score(motion_list[i])
         face_confidence = face_confidences_list[i]
+        face_quality = face_qualities_list[i]
         lighting_score = lighting_scores_list[i]
+
+        # Apply temporal jitter penalty to face quality
+        # Compute variance of mouth landmark positions over a short window
+        jitter_start = max(0, i - jitter_window // 2)
+        jitter_end = min(len(mouth_landmarks_history), i + jitter_window // 2 + 1)
+        window_mouth_landmarks = [ml for ml in mouth_landmarks_history[jitter_start:jitter_end] if ml is not None]
+        if len(window_mouth_landmarks) > 1:
+            # Stack to (window, 20, 2)
+            stacked = np.stack(window_mouth_landmarks, axis=0)
+            # Compute variance across window for each landmark
+            jitter = np.mean(np.var(stacked, axis=0))  # Mean variance across all mouth landmarks
+            # Heuristic: if jitter is high, penalize face quality
+            if jitter > 10.0:  # Threshold may need tuning
+                face_quality *= 0.5  # Penalize more if jitter is high
+
+        # Apply temporal consistency adjustment to face quality
+        if i > 0 and i < len(face_quality_history) - 1:
+            prev_quality = face_quality_history[i-1]
+            next_quality = face_quality_history[i+1] if i+1 < len(face_quality_history) else face_quality
+            avg_surrounding_quality = (prev_quality + next_quality) / 2
+            if face_quality < avg_surrounding_quality * 0.8:
+                face_quality *= 0.7
 
         # For stability, use a sliding window over poses
         start = max(0, i - stability_window_size // 2)
@@ -285,6 +420,7 @@ def process_video(cropped_frames, frame_indices, video_fps, pose_model):
             scorer.weights['pose'] * pose_score +
             scorer.weights['motion'] * motion_score +
             scorer.weights['face'] * face_confidence +
+            scorer.weights['face_quality'] * face_quality +
             scorer.weights['lighting'] * lighting_score +
             scorer.weights['stability'] * stability_score
         )
@@ -294,6 +430,7 @@ def process_video(cropped_frames, frame_indices, video_fps, pose_model):
             pose_score=float(pose_score),
             motion_score=float(motion_score),
             face_confidence=float(face_confidence),
+            face_quality=float(face_quality),
             lighting_score=float(lighting_score),
             stability_score=float(stability_score),
             final_score=float(final_score)
@@ -316,6 +453,7 @@ def process_video(cropped_frames, frame_indices, video_fps, pose_model):
         avg_pose_score = np.mean([m.pose_score for m in window_frame_metrics])
         avg_motion_score = np.mean([m.motion_score for m in window_frame_metrics])
         avg_face_confidence = np.mean([m.face_confidence for m in window_frame_metrics])
+        avg_face_quality = np.mean([m.face_quality for m in window_frame_metrics])
         avg_lighting_score = np.mean([m.lighting_score for m in window_frame_metrics])
         avg_stability_score = np.mean([m.stability_score for m in window_frame_metrics])
 
@@ -323,6 +461,7 @@ def process_video(cropped_frames, frame_indices, video_fps, pose_model):
             scorer.weights['pose'] * avg_pose_score +
             scorer.weights['motion'] * avg_motion_score +
             scorer.weights['face'] * avg_face_confidence +
+            scorer.weights['face_quality'] * avg_face_quality +
             scorer.weights['lighting'] * avg_lighting_score +
             scorer.weights['stability'] * avg_stability_score
         )
@@ -331,6 +470,7 @@ def process_video(cropped_frames, frame_indices, video_fps, pose_model):
             pose_score=avg_pose_score,
             motion_score=avg_motion_score,
             face_confidence=avg_face_confidence,
+            face_quality=avg_face_quality,
             lighting_score=avg_lighting_score,
             stability_score=avg_stability_score,
             final_score=final_score,
@@ -354,6 +494,7 @@ def process_video(cropped_frames, frame_indices, video_fps, pose_model):
     print(f"  - Pose: {best_metrics.pose_score:.3f}")
     print(f"  - Motion: {best_metrics.motion_score:.3f}")
     print(f"  - Face Confidence: {best_metrics.face_confidence:.3f}")
+    print(f"  - Face Quality: {best_metrics.face_quality:.3f}")
     print(f"  - Lighting: {best_metrics.lighting_score:.3f}")
     print(f"  - Stability: {best_metrics.stability_score:.3f}")
     print(f"  - Final Score: {best_metrics.final_score:.3f}")
@@ -369,7 +510,7 @@ def plot_all_metrics(times, yaws, pitches, rolls, motions,
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
     
-    fig, axs = plt.subplots(10, 1, figsize=(16, 28), sharex=True)
+    fig, axs = plt.subplots(11, 1, figsize=(16, 30), sharex=True)
     fig.suptitle('Comprehensive Inference Window Analysis', fontsize=16)
 
     best_window_start_time = times[best_start_idx]
@@ -401,10 +542,11 @@ def plot_all_metrics(times, yaws, pitches, rolls, motions,
         plot_window_metric(axs[5], [m.stability_score for m in frame_metrics], "Stability Score", 'maroon')
         plot_window_metric(axs[6], [m.motion_score for m in frame_metrics], "Motion Score", 'darkviolet')
         plot_window_metric(axs[7], [m.face_confidence for m in frame_metrics], "Face Confidence", 'cyan')
-        plot_window_metric(axs[8], [m.lighting_score for m in frame_metrics], "Lighting Score", 'magenta')
-        plot_window_metric(axs[9], [m.final_score for m in frame_metrics], "Final Score", 'blue')
+        plot_window_metric(axs[8], [m.face_quality for m in frame_metrics], "Face Quality", 'orange')
+        plot_window_metric(axs[9], [m.lighting_score for m in frame_metrics], "Lighting Score", 'magenta')
+        plot_window_metric(axs[10], [m.final_score for m in frame_metrics], "Final Score", 'blue')
 
-    axs[9].set_xlabel("Time (s)")
+    axs[10].set_xlabel("Time (s)")
     handles, labels = axs[0].get_legend_handles_labels()
     fig.legend(handles, labels, loc='upper right')
     plt.tight_layout(rect=[0, 0.03, 1, 0.96])
@@ -412,10 +554,11 @@ def plot_all_metrics(times, yaws, pitches, rolls, motions,
     print(f"\n📊 Combined plot saved to: {output_path}")
 
 def main():
-    if not torch.cuda.is_available():
-        print("❌ No GPU detected! Exiting to avoid CPU overload.")
-        exit(1)
     args = parse_args()
+    if not torch.cuda.is_available():
+        print("⚠️ No GPU detected! Running on CPU (this may be slower).")
+    else:
+        print("✅ GPU detected! Using CUDA acceleration.")
     print(f"Using device: {'cuda' if torch.cuda.is_available() else 'cpu'}")
 
     # Set up output plot path based on video name
@@ -439,10 +582,10 @@ def main():
     # Log per-frame metrics
     log_path = os.path.join(os.path.dirname(output_plot_path), f"{os.path.splitext(os.path.basename(output_plot_path))[0]}_log.csv")
     with open(log_path, 'w') as f:
-        f.write("time,yaw,pitch,roll,raw_motion,pose_score,motion_score,face_confidence,lighting_score,stability_score,final_score\n")
+        f.write("time,yaw,pitch,roll,raw_motion,pose_score,motion_score,face_confidence,face_quality,lighting_score,stability_score,final_score\n")
         for i, metrics in enumerate(frame_metrics):
             f.write(f"{metrics.time:.4f},{float(yaws[i]):.4f},{float(pitches[i]):.4f},{float(rolls[i]):.4f},{float(motions[i]):.4f},"
-                    f"{metrics.pose_score:.4f},{metrics.motion_score:.4f},{metrics.face_confidence:.4f},"
+                    f"{metrics.pose_score:.4f},{metrics.motion_score:.4f},{metrics.face_confidence:.4f},{metrics.face_quality:.4f},"
                     f"{metrics.lighting_score:.4f},{metrics.stability_score:.4f},{metrics.final_score:.4f}\n")
     print(f"📝 Per-frame metrics logged to: {log_path}")
 
